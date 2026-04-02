@@ -149,9 +149,10 @@ void loop() {
   lcd.print("   ");
 
   lcd.setCursor(0, 1);
-  lcd.print("Dist: ");
-  lcd.print(d);
-  lcd.print("cm   ");
-
+  Serial.print("DIST:");
+  Serial.print(d);
+  
+  Serial.print("|COUNT:");
+  Serial.println(occupancyCount);
   delay(200);
 }
