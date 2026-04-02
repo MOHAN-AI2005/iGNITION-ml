@@ -3,6 +3,7 @@
 
 #define TRIG_PIN 5
 #define ECHO_PIN 18
+#define BUZZER 23
 
 LiquidCrystal_PCF8574 lcd(0x27);
 
@@ -83,6 +84,9 @@ bool isDecreasing() {
 void setup() {
   Serial.begin(115200);
 
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(BUZZER, LOW);
+
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
@@ -105,6 +109,16 @@ void loop() {
   Serial.print(d);
   Serial.println(" cm");
 
+   if (Serial.available()) {
+    String msg = Serial.readStringUntil('\n');
+  
+    if (msg == "ALERT") {
+      digitalWrite(BUZZER, HIGH);
+    } else {
+      digitalWrite(BUZZER, LOW);
+    }
+  }
+  
   if (d != -1) {
     updateHistory(d);
 
