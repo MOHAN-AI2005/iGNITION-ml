@@ -3,9 +3,18 @@
 
 #define TRIG_PIN 5
 #define ECHO_PIN 18
-#define BUZZER 23
+#define BUZZER 25
+
+// Buzzer modes:
+// 0 = passive piezo (tone only)
+// 1 = active buzzer, active HIGH
+// 2 = active buzzer, active LOW
+// 3 = dual drive (tone + HIGH) for unknown buzzer type/wiring tests
+const uint8_t BUZZER_MODE = 3;
+const uint16_t BUZZER_TONE_HZ = 2200;
 
 LiquidCrystal_PCF8574 lcd(0x27);
+bool lcdReady = false;
 
 // -------- VARIABLES --------
 int occupancyCount = 0;
@@ -13,6 +22,8 @@ int occupancyCount = 0;
 bool serverAlertActive = false;
 unsigned long serverAlertUntil = 0;
 const unsigned long serverAlertHoldMs = 3000;
+
+bool buzzerState = false;
 
 long history[5] = {0};
 int histIndex = 0;
@@ -84,23 +95,83 @@ bool isDecreasing() {
   return true;
 }
 
+void setBuzzer(bool on) {
+  if (buzzerState == on) return;
+  buzzerState = on;
+
+  if (BUZZER_MODE == 0) {
+    if (on) tone(BUZZER, BUZZER_TONE_HZ);
+    else noTone(BUZZER);
+  } else if (BUZZER_MODE == 1) {
+    noTone(BUZZER);
+    digitalWrite(BUZZER, on ? HIGH : LOW);
+  } else if (BUZZER_MODE == 2) {
+    noTone(BUZZER);
+    digitalWrite(BUZZER, on ? LOW : HIGH);
+  } else {
+    if (on) {
+      tone(BUZZER, BUZZER_TONE_HZ);
+      digitalWrite(BUZZER, HIGH);
+    } else {
+      noTone(BUZZER);
+      digitalWrite(BUZZER, LOW);
+    }
+  }
+
+  Serial.print("BUZZER:");
+  Serial.print(on ? "ON" : "OFF");
+  Serial.print(" MODE:");
+  Serial.println(BUZZER_MODE);
+}
+
+void buzzerSelfTest() {
+  // Audible startup check so wiring/type problems are obvious immediately.
+  setBuzzer(true);
+  delay(350);
+  setBuzzer(false);
+  delay(150);
+  setBuzzer(true);
+  delay(350);
+  setBuzzer(false);
+}
+
+bool i2cDevicePresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
 // -------- SETUP --------
 void setup() {
   Serial.begin(115200);
   
   pinMode(BUZZER, OUTPUT);
   digitalWrite(BUZZER, LOW);
+  noTone(BUZZER);
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  lcd.begin(16, 2);
-  lcd.setBacklight(255);
+  Wire.begin();
+  if (i2cDevicePresent(0x27)) {
+    lcd.begin(16, 2);
+    lcd.setBacklight(255);
+    lcd.setCursor(0, 0);
+    lcd.print("People Counter");
+    delay(1000);
+    lcd.clear();
+    lcdReady = true;
+    Serial.println("LCD:READY");
+  } else {
+    lcdReady = false;
+    Serial.println("LCD:NOT_FOUND (running without LCD)");
+  }
 
-  lcd.setCursor(0, 0);
-  lcd.print("People Counter");
-  delay(1000);
-  lcd.clear();
+  Serial.print("READY BUZZER_PIN=");
+  Serial.print(BUZZER);
+  Serial.print(" MODE=");
+  Serial.println(BUZZER_MODE);
+
+  buzzerSelfTest();
 }
 
 // -------- LOOP --------
@@ -118,9 +189,28 @@ void loop() {
     msg.trim();
   
     if (msg.startsWith("ALERT")) {
+      Serial.print("CMD:");
+      Serial.println(msg);
       serverAlertActive = true;
       serverAlertUntil = millis() + serverAlertHoldMs;
+    } else if (msg == "BUZZER_TEST") {
+      Serial.println("CMD:BUZZER_TEST");
+      buzzerSelfTest();
+    } else if (msg == "BUZZER_ON") {
+      Serial.println("CMD:BUZZER_ON");
+      setBuzzer(true);
+      delay(1200);
+      setBuzzer(false);
+    } else if (msg == "BUZZER_PULSE") {
+      Serial.println("CMD:BUZZER_PULSE");
+      for (int i = 0; i < 8; i++) {
+        setBuzzer(true);
+        delay(120);
+        setBuzzer(false);
+        delay(120);
+      }
     } else if (msg == "OK") {
+      Serial.println("CMD:OK");
       serverAlertActive = false;
       serverAlertUntil = 0;
     }
@@ -131,9 +221,9 @@ void loop() {
   }
 
   if (serverAlertActive) {
-    digitalWrite(BUZZER, HIGH);
+    setBuzzer(true);
   } else {
-    digitalWrite(BUZZER, LOW);
+    setBuzzer(false);
   }
   
   if (d != -1) {
@@ -149,9 +239,11 @@ void loop() {
         Serial.print(occupancyCount);
         Serial.println(",DOOR:MAIN,EVENT:ENTER");
 
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print(">> ENTER >>");
+        if (lcdReady) {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print(">> ENTER >>");
+        }
         delay(500);
 
         lastTriggerTime = millis();
@@ -168,9 +260,11 @@ void loop() {
         Serial.print(occupancyCount);
         Serial.println(",DOOR:MAIN,EVENT:EXIT");
 
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("<< EXIT <<");
+        if (lcdReady) {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("<< EXIT <<");
+        }
         delay(500);
 
         lastTriggerTime = millis();
@@ -179,17 +273,18 @@ void loop() {
   }
 
   // LCD DISPLAY
-  lcd.setCursor(0, 0);
-  lcd.print("People: ");
-  lcd.print(occupancyCount);
-  lcd.print("   ");
+  if (lcdReady) {
+    lcd.setCursor(0, 0);
+    lcd.print("People: ");
+    lcd.print(occupancyCount);
+    lcd.print("   ");
 
-  lcd.setCursor(0, 1);
-  lcd.print("Dist:");
-  lcd.print(d);
-  lcd.print("   ");
+    lcd.setCursor(0, 1);
+    lcd.print("Dist:");
+    lcd.print(d);
+    lcd.print("   ");
+  }
   
-  lcd.setCursor(0, 1);
   Serial.print("DIST:");
   Serial.print(d);
   
