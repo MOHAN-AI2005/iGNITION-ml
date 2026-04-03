@@ -40,7 +40,7 @@ FACE_LANDMARKER_PATH = Path(
 )
 
 SERIAL_PORT = os.getenv("BUS_SERIAL_PORT", "auto")
-SERIAL_BAUD = int(os.getenv("BUS_SERIAL_BAUD", "115200"))
+SERIAL_BAUD = int(os.getenv("BUS_SERIAL_BAUD", "74880"))
 CAMERA_INDEX = int(os.getenv("BUS_CAMERA_INDEX", "0"))
 IMG_SIZE = 48
 EYE_MODEL_OUTPUT = os.getenv("EYE_MODEL_OUTPUT", "open").strip().lower()
@@ -309,6 +309,27 @@ else:
     print(f"Serial not connected (port={SERIAL_PORT})")
 
 serial_writer = BusSerialWriter(serial_reader.ser)
+
+
+def send_buzzer_command(level):
+    global serial_writer
+
+    if serial_writer.send_alert_level(level):
+        return True
+
+    # If write failed (port reset/disconnected), try one reconnect and retry once.
+    print(f"Serial write failed for {level}, attempting reconnect...")
+    if serial_reader.connect():
+        serial_writer = BusSerialWriter(serial_reader.ser)
+        ok = serial_writer.send_alert_level(level)
+        if ok:
+            print(f"Serial reconnected on {SERIAL_PORT} and resent {level}")
+        else:
+            print(f"Serial reconnect succeeded but resend failed for {level}")
+        return ok
+
+    print("Serial reconnect failed")
+    return False
 
 # -------- GLOBAL STATES --------
 student_count = 0
@@ -930,9 +951,9 @@ while True:
         should_send = True
 
     if should_send:
-        serial_writer.send_alert_level(buzzer_level)
-        last_sent_alert = buzzer_level
-        last_alert_tx_time = now
+        if send_buzzer_command(buzzer_level):
+            last_sent_alert = buzzer_level
+            last_alert_tx_time = now
 
     # ---- COLOR ----
     color = (0,255,0)
@@ -972,10 +993,10 @@ while True:
 
     # Manual buzzer test shortcuts.
     if key == ord('b'):
-        serial_writer.send("ALERT_HIGH")
+        send_buzzer_command("HIGH")
         print("Manual buzzer test: ALERT_HIGH sent")
     elif key == ord('n'):
-        serial_writer.send("OK")
+        send_buzzer_command("NORMAL")
         print("Manual buzzer test: OK sent")
 
     if key == 27:
