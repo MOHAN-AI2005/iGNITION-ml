@@ -1,35 +1,49 @@
-import os
-import pandas as pd
-import numpy as np
+from pathlib import Path
 
-DATA_DIR = "../../data/head_dataset"
+import numpy as np
+import pandas as pd
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data" / "head_dataset"
+OUT_X = Path(__file__).resolve().parent / "X_head.npy"
+OUT_Y = Path(__file__).resolve().parent / "y_head.npy"
 
 labels = ["normal", "tilt_forward", "tilt_side", "look_away"]
+label_map = {label: idx for idx, label in enumerate(labels)}
 
 X = []
 y = []
 
-label_map = {label: idx for idx, label in enumerate(labels)}
-
 for label in labels:
-    folder = os.path.join(DATA_DIR, label)
+    folder = DATA_DIR / label
+    if not folder.exists():
+        print(f"Skipping missing folder: {folder}")
+        continue
 
-    for file in os.listdir(folder):
-        if file.endswith(".csv"):
-            path = os.path.join(folder, file)
+    for csv_file in sorted(folder.glob("*.csv")):
+        df = pd.read_csv(csv_file)
+        required = {"pitch", "yaw", "roll"}
+        if not required.issubset(set(df.columns)):
+            print(f"Skipping malformed file: {csv_file}")
+            continue
 
-            df = pd.read_csv(path)
+        values = df[["pitch", "yaw", "roll"]].to_numpy(dtype=np.float32)
+        if len(values) == 0:
+            continue
 
-            for _, row in df.iterrows():
-                X.append(row.values)
-                y.append(label_map[label])
+        X.extend(values)
+        y.extend([label_map[label]] * len(values))
 
-X = np.array(X)
-y = np.array(y)
+X = np.array(X, dtype=np.float32)
+y = np.array(y, dtype=np.int64)
 
-# Save
-np.save("X_head.npy", X)
-np.save("y_head.npy", y)
+if len(X) == 0:
+    raise RuntimeError("No head dataset samples found. Record data first.")
+
+np.save(OUT_X, X)
+np.save(OUT_Y, y)
 
 print("Dataset shape:", X.shape)
 print("Labels shape:", y.shape)
+print("Saved:", OUT_X)
+print("Saved:", OUT_Y)

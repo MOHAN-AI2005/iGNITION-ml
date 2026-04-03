@@ -4,6 +4,7 @@ import platform
 import sys
 import time
 import json
+import glob
 from collections import deque
 from pathlib import Path
 
@@ -21,8 +22,16 @@ if str(SRC_DIR) not in sys.path:
 from communication.serial_reader import BusSerialReader
 from communication.serial_writer import BusSerialWriter
 
+try:
+    from serial.tools import list_ports
+except Exception:
+    list_ports = None
+
 # -------- PATH CONFIG --------
 EYE_MODEL_PATH = Path(os.getenv("EYE_MODEL_PATH", ROOT_DIR / "models" / "eye_model.keras"))
+HEAD_MODEL_PATH = Path(os.getenv("HEAD_MODEL_PATH", ROOT_DIR / "models" / "head_model.keras"))
+HEAD_SCALER_PATH = Path(os.getenv("HEAD_SCALER_PATH", ROOT_DIR / "models" / "head_scaler.npz"))
+HEAD_CLASSES_PATH = Path(os.getenv("HEAD_CLASSES_PATH", ROOT_DIR / "models" / "head_classes.json"))
 FACE_LANDMARKER_PATH = Path(
     os.getenv(
         "FACE_LANDMARKER_PATH",
@@ -30,7 +39,7 @@ FACE_LANDMARKER_PATH = Path(
     )
 )
 
-SERIAL_PORT = os.getenv("BUS_SERIAL_PORT", "/dev/ttyUSB0")
+SERIAL_PORT = os.getenv("BUS_SERIAL_PORT", "auto")
 SERIAL_BAUD = int(os.getenv("BUS_SERIAL_BAUD", "115200"))
 CAMERA_INDEX = int(os.getenv("BUS_CAMERA_INDEX", "0"))
 IMG_SIZE = 48
@@ -56,7 +65,43 @@ CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480"))
 ALERT_RESEND_INTERVAL_SEC = float(os.getenv("ALERT_RESEND_INTERVAL_SEC", "0.7"))
 BUZZER_ON_MEDIUM = os.getenv("BUZZER_ON_MEDIUM", "1").strip().lower() in {"1", "true", "yes", "on"}
 MEDIUM_BUZZER_DELAY_SEC = float(os.getenv("MEDIUM_BUZZER_DELAY_SEC", "1.2"))
+HEAD_MODEL_CONF_THRESHOLD = float(os.getenv("HEAD_MODEL_CONF_THRESHOLD", "0.55"))
+HEAD_LOOK_AWAY_SUPPRESS = os.getenv("HEAD_LOOK_AWAY_SUPPRESS", "1").strip().lower() in {"1", "true", "yes", "on"}
 WINDOW_NAME = "SMART BUS SAFETY SYSTEM"
+
+
+def resolve_serial_port(configured_port):
+    port_value = (configured_port or "").strip()
+    if port_value and port_value.lower() not in {"auto", "detect", ""}:
+        return port_value
+
+    detected = []
+    if list_ports is not None:
+        try:
+            detected = [p.device for p in list_ports.comports() if p.device]
+        except Exception:
+            detected = []
+
+    if not detected and platform.system().lower() != "windows":
+        for pattern in ["/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyAMA*", "/dev/ttyS*"]:
+            detected.extend(glob.glob(pattern))
+
+    if not detected:
+        if platform.system().lower() == "windows":
+            return "COM3"
+        return "/dev/ttyUSB0"
+
+    def _port_priority(dev):
+        name = dev.lower()
+        if "ttyacm" in name:
+            return (0, name)
+        if "ttyusb" in name:
+            return (1, name)
+        if "ttyama" in name:
+            return (2, name)
+        return (3, name)
+
+    return sorted(set(detected), key=_port_priority)[0]
 
 
 def _profile_path(driver_name):
@@ -177,6 +222,28 @@ model = load_model(
     compile=False,
 )
 
+HEAD_CLASSES = ["normal", "tilt_forward", "tilt_side", "look_away"]
+head_model = None
+head_scaler_mean = None
+head_scaler_std = None
+
+if HEAD_MODEL_PATH.exists() and HEAD_SCALER_PATH.exists():
+    try:
+        head_model = load_model(str(HEAD_MODEL_PATH), compile=False)
+        scaler = np.load(HEAD_SCALER_PATH)
+        head_scaler_mean = scaler["mean"].astype(np.float32)
+        head_scaler_std = scaler["std"].astype(np.float32)
+        head_scaler_std = np.where(head_scaler_std < 1e-6, 1.0, head_scaler_std)
+        if HEAD_CLASSES_PATH.exists():
+            with HEAD_CLASSES_PATH.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, list) and len(loaded) >= 4:
+                    HEAD_CLASSES = loaded
+        print(f"Head model loaded from {HEAD_MODEL_PATH}")
+    except Exception as exc:
+        head_model = None
+        print(f"Head model load failed: {exc}")
+
 # -------- MEDIAPIPE --------
 BaseOptions = mp.tasks.BaseOptions
 FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -190,6 +257,7 @@ options = FaceLandmarkerOptions(
 landmarker = FaceLandmarker.create_from_options(options)
 
 # -------- SERIAL SETUP --------
+SERIAL_PORT = resolve_serial_port(SERIAL_PORT)
 serial_reader = BusSerialReader(port=SERIAL_PORT, baud=SERIAL_BAUD, timeout=1.0)
 if serial_reader.connect():
     print(f"Serial connected on {SERIAL_PORT} @ {SERIAL_BAUD}")
@@ -340,6 +408,29 @@ def estimate_head_pose(lm):
     }
 
 
+def classify_head_state(head_pose):
+    if head_pose is None:
+        return "unknown", 0.0
+
+    if head_model is not None and head_scaler_mean is not None and head_scaler_std is not None:
+        feat = np.array([[head_pose["pitch"], head_pose["yaw"], head_pose["roll_deg"]]], dtype=np.float32)
+        feat = (feat - head_scaler_mean) / head_scaler_std
+        probs = head_model.predict(feat, verbose=0).reshape(-1)
+        idx = int(np.argmax(probs))
+        conf = float(probs[idx])
+        if idx < len(HEAD_CLASSES) and conf >= HEAD_MODEL_CONF_THRESHOLD:
+            return HEAD_CLASSES[idx], conf
+
+    # Fallback heuristic when model is unavailable/uncertain.
+    if abs(head_pose["yaw"]) > HEAD_YAW_THRESHOLD * 1.6:
+        return "look_away", 0.5
+    if head_pose["pitch"] > HEAD_PITCH_THRESHOLD * 1.4:
+        return "tilt_forward", 0.5
+    if abs(head_pose["roll_deg"]) > HEAD_ROLL_THRESHOLD_DEG * 1.2:
+        return "tilt_side", 0.5
+    return "normal", 0.5
+
+
 def closed_prob_from_model(raw_prob):
     raw_prob = float(np.clip(raw_prob, 0.0, 1.0))
     if EYE_MODEL_OUTPUT == "closed":
@@ -371,12 +462,15 @@ def extract_eye_metrics(frame):
     mean_ear = None
     face_detected = False
     head_pose = None
+    head_state = "unknown"
+    head_conf = 0.0
     drowsy_valid = False
 
     if result.face_landmarks:
         face_detected = True
         lm = result.face_landmarks[0]
         head_pose = estimate_head_pose(lm)
+        head_state, head_conf = classify_head_state(head_pose)
         drowsy_valid = head_pose["is_frontal"]
 
         left_eye = extract_eye(frame, lm, LEFT_EYE, w, h)
@@ -424,6 +518,8 @@ def extract_eye_metrics(frame):
         "closed_prob_ear": closed_prob_ear,
         "fused_closed_prob": fused_closed_prob,
         "head_pose": head_pose,
+        "head_state": head_state,
+        "head_conf": head_conf,
         "drowsy_valid": drowsy_valid,
         "eyes_visible": eyes_visible if face_detected else 0,
     }
@@ -589,6 +685,8 @@ cached_metrics = {
     "closed_prob_ear": None,
     "fused_closed_prob": 0.0,
     "head_pose": None,
+    "head_state": "unknown",
+    "head_conf": 0.0,
     "drowsy_valid": False,
     "eyes_visible": 0,
 }
@@ -634,6 +732,8 @@ while True:
     face_detected = metrics["face_detected"]
     drowsy_valid = metrics["drowsy_valid"]
     head_pose = metrics["head_pose"]
+    head_state = metrics.get("head_state", "unknown")
+    head_conf = metrics.get("head_conf", 0.0)
     eyes_visible = metrics.get("eyes_visible", 0)
 
     # ---- DROWSINESS ----
@@ -656,6 +756,12 @@ while True:
     vision_valid = face_detected and drowsy_valid and eyes_visible >= 2
     if not vision_valid and final_alert in {"MEDIUM", "HIGH"}:
         final_alert = "NORMAL"
+
+    # Use integrated head model output to reduce false positives and escalate risky posture.
+    if HEAD_LOOK_AWAY_SUPPRESS and head_state == "look_away" and final_alert in {"MEDIUM", "HIGH"}:
+        final_alert = "NORMAL"
+    elif head_state in {"tilt_forward", "tilt_side"} and final_alert == "MEDIUM":
+        final_alert = "HIGH"
 
     key = -1
 
@@ -680,14 +786,6 @@ while True:
         # Keep sending ALERT periodically so Arduino latch stays active.
         should_send = True
 
-    # Manual buzzer test shortcuts.
-    if key == ord('b'):
-        serial_writer.send("ALERT_TEST")
-        print("Manual buzzer test: ALERT_TEST sent")
-    elif key == ord('n'):
-        serial_writer.send("OK")
-        print("Manual buzzer test: OK sent")
-
     if should_send:
         serial_writer.send_alert_level(buzzer_level)
         last_sent_alert = buzzer_level
@@ -709,22 +807,31 @@ while True:
         pose_text = "POSE:FRONTAL" if drowsy_valid else "POSE:TURNING"
         pose_color = (0, 255, 0) if drowsy_valid else (0, 165, 255)
         cv2.putText(frame, pose_text, (310, 77), 0, 0.55, pose_color, 2)
+        cv2.putText(frame, f"HeadState: {head_state} ({head_conf:.2f})", (10, 102), 0, 0.55, (180, 255, 180), 2)
     else:
         cv2.putText(frame, "POSE:NO FACE", (310, 77), 0, 0.55, (0, 0, 255), 2)
     cv2.putText(frame, f"PERCLOS: {perclos:.2f}", (10,85), 0, 0.7, (255,255,255), 2)
     if final_alert == "MEDIUM" and medium_state_since is not None:
         cv2.putText(frame, f"MEDIUM delay: {max(0.0, MEDIUM_BUZZER_DELAY_SEC - (time.time() - medium_state_since)):.1f}s", (220,85), 0, 0.6, (255,255,255), 2)
-    cv2.putText(frame, f"IMU: {imu_state}", (10,110), 0, 0.7, (255,255,255), 2)
+    cv2.putText(frame, f"IMU: {imu_state}", (10,125), 0, 0.7, (255,255,255), 2)
 
-    cv2.putText(frame, f"Students: {student_count}", (10,140), 0, 0.8, (255,255,255), 2)
-    cv2.putText(frame, f"{last_event} @ {last_door}", (10,170), 0, 0.6, (200,200,255), 2)
-    cv2.putText(frame, f"Dist: {last_distance}", (10,195), 0, 0.6, (255,255,200), 2)
-    cv2.putText(frame, f"BPM: {last_bpm}", (220,195), 0, 0.6, (255,255,200), 2)
+    cv2.putText(frame, f"Students: {student_count}", (10,150), 0, 0.8, (255,255,255), 2)
+    cv2.putText(frame, f"{last_event} @ {last_door}", (10,180), 0, 0.6, (200,200,255), 2)
+    cv2.putText(frame, f"Dist: {last_distance}", (10,205), 0, 0.6, (255,255,200), 2)
+    cv2.putText(frame, f"BPM: {last_bpm}", (220,205), 0, 0.6, (255,255,200), 2)
 
     cv2.putText(frame, f"FINAL: {final_alert}", (10,225), 0, 1.0, color, 3)
 
     cv2.imshow(WINDOW_NAME, frame)
     key = cv2.waitKey(1) & 0xFF
+
+    # Manual buzzer test shortcuts.
+    if key == ord('b'):
+        serial_writer.send("ALERT_TEST")
+        print("Manual buzzer test: ALERT_TEST sent")
+    elif key == ord('n'):
+        serial_writer.send("OK")
+        print("Manual buzzer test: OK sent")
 
     if key == 27:
         break
