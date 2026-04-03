@@ -68,6 +68,8 @@ BUZZER_ON_MEDIUM = os.getenv("BUZZER_ON_MEDIUM", "1").strip().lower() in {"1", "
 MEDIUM_BUZZER_DELAY_SEC = float(os.getenv("MEDIUM_BUZZER_DELAY_SEC", "1.2"))
 HEAD_MODEL_CONF_THRESHOLD = float(os.getenv("HEAD_MODEL_CONF_THRESHOLD", "0.55"))
 HEAD_LOOK_AWAY_SUPPRESS = os.getenv("HEAD_LOOK_AWAY_SUPPRESS", "1").strip().lower() in {"1", "true", "yes", "on"}
+FACE_MISSING_ALERT_SEC = float(os.getenv("FACE_MISSING_ALERT_SEC", "0.8"))
+FACE_MISSING_MAX_SEC = float(os.getenv("FACE_MISSING_MAX_SEC", "3.0"))
 WINDOW_NAME = "SMART BUS SAFETY SYSTEM"
 
 HEAD_YAW_CENTER = 0.0
@@ -790,6 +792,9 @@ last_sent_alert = ""
 last_alert_tx_time = 0.0
 medium_state_since = None
 frame_idx = 0
+last_face_seen_ts = time.time()
+last_head_pose_seen = None
+last_head_state_seen = "unknown"
 cached_metrics = {
     "face_detected": False,
     "eye_prob": 0.0,
@@ -851,6 +856,14 @@ while True:
     pose_frontal = metrics.get("pose_frontal", False)
     eyes_visible = metrics.get("eyes_visible", 0)
 
+    now = time.time()
+    if face_detected:
+        last_face_seen_ts = now
+        last_head_state_seen = head_state
+        if head_pose is not None:
+            last_head_pose_seen = head_pose
+    face_missing_secs = max(0.0, now - last_face_seen_ts) if not face_detected else 0.0
+
     # ---- DROWSINESS ----
     score, perclos, duration = tracker.update(fused_closed_prob, face_detected=(face_detected and drowsy_valid))
 
@@ -878,10 +891,25 @@ while True:
     elif head_state in {"tilt_forward", "tilt_side"} and final_alert == "MEDIUM":
         final_alert = "HIGH"
 
+    # Handle brief landmark dropouts while driver's head is tilted down/side.
+    if not face_detected and FACE_MISSING_ALERT_SEC <= face_missing_secs <= FACE_MISSING_MAX_SEC:
+        recent_forward = False
+        recent_side = False
+        if last_head_pose_seen is not None:
+            recent_forward = last_head_pose_seen.get("pitch_dev", 0.0) > (HEAD_PITCH_THRESHOLD_ACTIVE * 0.85)
+            recent_side = (
+                abs(last_head_pose_seen.get("yaw_dev", 0.0)) > (HEAD_YAW_THRESHOLD_ACTIVE * 1.1)
+                or abs(last_head_pose_seen.get("roll_dev", 0.0)) > (HEAD_ROLL_THRESHOLD_DEG_ACTIVE * 1.05)
+            )
+
+        if last_head_state_seen == "tilt_forward" or recent_forward:
+            final_alert = "HIGH"
+        elif last_head_state_seen in {"tilt_side", "look_away"} or recent_side:
+            final_alert = "MEDIUM"
+
     key = -1
 
     # ---- SEND ALERT ----
-    now = time.time()
     buzzer_level = final_alert
     if final_alert == "MEDIUM":
         if medium_state_since is None:
@@ -925,6 +953,8 @@ while True:
         cv2.putText(frame, f"HeadState: {head_state} ({head_conf:.2f})", (10, 102), 0, 0.55, (180, 255, 180), 2)
     else:
         cv2.putText(frame, "POSE:NO FACE", (310, 77), 0, 0.55, (0, 0, 255), 2)
+        if face_missing_secs > 0:
+            cv2.putText(frame, f"Face missing: {face_missing_secs:.1f}s", (10, 102), 0, 0.55, (0, 165, 255), 2)
     cv2.putText(frame, f"PERCLOS: {perclos:.2f}", (10,85), 0, 0.7, (255,255,255), 2)
     if final_alert == "MEDIUM" and medium_state_since is not None:
         cv2.putText(frame, f"MEDIUM delay: {max(0.0, MEDIUM_BUZZER_DELAY_SEC - (time.time() - medium_state_since)):.1f}s", (220,85), 0, 0.6, (255,255,255), 2)
